@@ -25,22 +25,35 @@ RUN --mount=type=cache,target=/go/pkg/mod \
     test -f ./cmd/notion2api/main.go \
     && CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build -v -trimpath -ldflags="-s -w" -o /out/notion2api ./cmd/notion2api
 
-FROM debian:bookworm-slim
+FROM mcr.microsoft.com/playwright:v1.58.0-noble
 
 ENV TZ=Asia/Shanghai
+ENV CHROME_BIN=/ms-playwright/chromium-1208/chrome-linux64/chrome
+ENV CHROMIUM_BIN=/ms-playwright/chromium-1208/chrome-linux64/chrome
+ENV NODE_PATH=/opt/playwright-helper/node_modules
 WORKDIR /app
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates tzdata curl \
     && rm -rf /var/lib/apt/lists/* \
+    && test -x "$CHROME_BIN" \
+    && "$CHROME_BIN" --version | grep -F "145.0.7632.6" \
     && mkdir -p /app/config /app/data/notion_accounts /app/static
+
+RUN mkdir -p /opt/playwright-helper \
+    && cd /opt/playwright-helper \
+    && npm init -y >/dev/null 2>&1 \
+    && npm install --omit=dev --no-package-lock playwright-core@1.58.0 \
+    && test -d "$NODE_PATH/playwright-core" \
+    && npm cache clean --force >/dev/null 2>&1
 
 COPY --from=builder /out/notion2api /app/notion2api
 COPY --from=builder /src/static /app/static
 COPY config.docker.json /app/config/config.default.json
 COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 
-RUN chmod +x /usr/local/bin/docker-entrypoint.sh
+RUN sed -i 's/\r$//' /usr/local/bin/docker-entrypoint.sh \
+    && chmod +x /usr/local/bin/docker-entrypoint.sh
 
 EXPOSE 8787
 

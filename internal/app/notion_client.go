@@ -21,10 +21,51 @@ import (
 	"time"
 )
 
-const maxAttachmentBytes = 20 * 1024 * 1024
+const (
+	maxAttachmentBytes              = 20 * 1024 * 1024
+	bestEffortUpstreamTimeout       = 5 * time.Second
+	bestEffortPostRunTimeout        = 3 * time.Second
+	browserFallbackTimeout          = 30 * time.Second
+	bestEffortBudgetDivisor   int64 = 4
+)
 
 var leadingLangTagPattern = regexp.MustCompile(`(?is)^\s*(?:<lang\b[^>]*>|</lang>)\s*`)
 var prefixedTranscriptStepIDPattern = regexp.MustCompile(`^(?:cfg|ctx|upd)_([0-9a-fA-F]{32})$`)
+
+func bestEffortTimeout(parent context.Context, cap time.Duration) time.Duration {
+	if cap <= 0 {
+		return 0
+	}
+	if parent == nil {
+		return cap
+	}
+	if err := parent.Err(); err != nil {
+		return 0
+	}
+	if deadline, ok := parent.Deadline(); ok {
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			return 0
+		}
+		budget := remaining / time.Duration(bestEffortBudgetDivisor)
+		if budget <= 0 {
+			budget = remaining
+		}
+		if budget < cap {
+			cap = budget
+		}
+	}
+	return cap
+}
+
+func bestEffortContext(parent context.Context, cap time.Duration) (context.Context, context.CancelFunc, bool) {
+	timeout := bestEffortTimeout(parent, cap)
+	if timeout <= 0 {
+		return nil, func() {}, false
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	return ctx, cancel, true
+}
 
 func sanitizeAssistantVisibleText(text string) string {
 	clean := strings.TrimSpace(strings.TrimPrefix(text, "\uFEFF"))
@@ -207,6 +248,48 @@ type agentMessage struct {
 	Reasoning     string
 }
 
+type inferenceStepError struct {
+	ThreadID   string
+	MessageID  string
+	Message    string
+	SubType    string
+	TraceID    string
+	Retryable  bool
+	StackTrace string
+}
+
+func (e *inferenceStepError) Error() string {
+	if e == nil {
+		return ""
+	}
+	message := firstNonEmpty(strings.TrimSpace(e.Message), "upstream inference failed")
+	details := []string{}
+	if clean := strings.TrimSpace(e.SubType); clean != "" {
+		details = append(details, "sub_type="+clean)
+	}
+	if clean := strings.TrimSpace(e.TraceID); clean != "" {
+		details = append(details, "trace_id="+clean)
+	}
+	if e.Retryable {
+		details = append(details, "retryable=true")
+	}
+	if len(details) == 0 {
+		return fmt.Sprintf("thread %s failed: %s", strings.TrimSpace(e.ThreadID), message)
+	}
+	return fmt.Sprintf("thread %s failed: %s (%s)", strings.TrimSpace(e.ThreadID), message, strings.Join(details, " "))
+}
+
+type inferenceTransportError struct {
+	Message string
+}
+
+func (e *inferenceTransportError) Error() string {
+	if e == nil {
+		return ""
+	}
+	return strings.TrimSpace(e.Message)
+}
+
 type uploadDescriptor struct {
 	URL                 string         `json:"url"`
 	SignedGetURL        string         `json:"signedGetUrl"`
@@ -234,12 +317,13 @@ func (e *notionAPIError) Error() string {
 }
 
 type NotionAIClient struct {
-	Session       SessionInfo
-	Config        AppConfig
-	Timeout       time.Duration
-	PollInterval  time.Duration
-	PollMaxRounds int
-	HTTPClient    *http.Client
+	Session                     SessionInfo
+	Config                      AppConfig
+	Timeout                     time.Duration
+	PollInterval                time.Duration
+	PollMaxRounds               int
+	HTTPClient                  *http.Client
+	browserRunInferenceFallback func(context.Context, map[string]any) (string, error)
 }
 
 type ndjsonPatchOperation struct {
@@ -423,8 +507,13 @@ func (c *NotionAIClient) ensureSessionLiveMetadata(ctx context.Context) {
 	if len(c.Session.Cookies) == 0 || strings.TrimSpace(c.Session.UserID) == "" || strings.TrimSpace(c.Session.ClientVersion) == "" {
 		return
 	}
+	bestEffortCtx, cancel, ok := bestEffortContext(ctx, bestEffortUpstreamTimeout)
+	if !ok {
+		return
+	}
+	defer cancel()
 	body, err := c.postJSONWithReferer(
-		ctx,
+		bestEffortCtx,
 		c.Config.NotionUpstream().API("loadUserContent"),
 		map[string]any{},
 		"application/json",
@@ -440,19 +529,22 @@ func (c *NotionAIClient) ensureSessionLiveMetadata(ctx context.Context) {
 			c.Session.SpaceViewID = firstNonEmpty(strings.TrimSpace(c.Session.SpaceViewID), strings.TrimSpace(meta.SpaceViewID))
 			c.Session.SpaceName = firstNonEmpty(strings.TrimSpace(meta.SpaceName), strings.TrimSpace(c.Session.SpaceName))
 		}
+	} else {
+		c.logBestEffortFailure("loadUserContent", err)
 	}
 	if strings.TrimSpace(c.Session.SpaceViewID) != "" && strings.TrimSpace(c.Session.SpaceName) != "" && strings.TrimSpace(c.Session.UserName) != "" {
 		_ = c.persistSessionProbe()
 		return
 	}
 	body, err = c.postJSONWithReferer(
-		ctx,
+		bestEffortCtx,
 		c.Config.NotionUpstream().API("getSpacesInitial"),
 		map[string]any{},
 		"application/json",
 		c.Config.NotionUpstream().HomeURL(),
 	)
 	if err != nil {
+		c.logBestEffortFailure("getSpacesInitial", err)
 		return
 	}
 	var payload map[string]any
@@ -863,6 +955,99 @@ func (c *NotionAIClient) postJSONResponseWithReferer(ctx context.Context, url st
 	return resp, nil
 }
 
+func isTrustRuleDeniedInferenceError(err error) bool {
+	if err == nil {
+		return false
+	}
+	var stepErr *inferenceStepError
+	if !errors.As(err, &stepErr) {
+		return false
+	}
+	return strings.EqualFold(strings.TrimSpace(stepErr.SubType), "trust-rule-denied")
+}
+
+func (c *NotionAIClient) runInferenceTranscriptHTTP(ctx context.Context, payload map[string]any, threadID string, sink InferenceStreamSink) (ndjsonParseResult, error) {
+	resp, err := c.postJSONResponse(ctx, c.Config.NotionUpstream().API("runInferenceTranscript"), payload, "application/x-ndjson")
+	if err != nil {
+		return ndjsonParseResult{}, err
+	}
+	defer resp.Body.Close()
+
+	stopKeepAlive := make(chan struct{})
+	defer close(stopKeepAlive)
+	if sink.KeepAlive != nil {
+		go func() {
+			ticker := time.NewTicker(10 * time.Second)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-stopKeepAlive:
+					return
+				case <-ticker.C:
+					_ = sink.EmitKeepAlive()
+				}
+			}
+		}()
+	}
+
+	return consumeNDJSONStreamWithIdleClose(resp.Body, threadID, sink, ndjsonIdleAfterAnswerTimeout)
+}
+
+func (c *NotionAIClient) runInferenceTranscriptInBrowser(ctx context.Context, payload map[string]any) (string, error) {
+	return runInferenceTranscriptInBrowser(ctx, c, payload)
+}
+
+func (c *NotionAIClient) runInferenceTranscriptWithFallback(ctx context.Context, payload map[string]any, threadID string, sink InferenceStreamSink) (ndjsonParseResult, error) {
+	if c.Config.DebugUpstream {
+		log.Printf("[debug_upstream] runInferenceTranscript http start thread_id=%s", threadID)
+	}
+	parsed, err := c.runInferenceTranscriptHTTP(ctx, payload, threadID, sink)
+	if c.Config.DebugUpstream {
+		log.Printf("[debug_upstream] runInferenceTranscript http done thread_id=%s line_count=%d message_ids=%d err=%v", threadID, parsed.LineCount, len(parsed.MessageIDs), err)
+	}
+	if !isTrustRuleDeniedInferenceError(err) {
+		return parsed, err
+	}
+
+	runFallback := c.browserRunInferenceFallback
+	if runFallback == nil && !c.supportsBrowserRunInferenceFallback() {
+		return parsed, err
+	}
+	if runFallback == nil {
+		runFallback = c.runInferenceTranscriptInBrowser
+	}
+	fallbackCtx := ctx
+	fallbackCancel := func() {}
+	if timeout := bestEffortTimeout(ctx, browserFallbackTimeout); timeout > 0 {
+		fallbackCtx, fallbackCancel = context.WithTimeout(ctx, timeout)
+	}
+	defer fallbackCancel()
+	if c.Config.DebugUpstream {
+		log.Printf("[debug_upstream] runInferenceTranscript browser fallback start thread_id=%s", threadID)
+	}
+	body, fallbackErr := runFallback(fallbackCtx, payload)
+	if fallbackErr != nil {
+		c.logBestEffortFailure("runInferenceTranscriptInBrowser", fallbackErr)
+		message := fmt.Sprintf("%v; browser fallback failed: %v", err, fallbackErr)
+		if errors.Is(fallbackErr, context.DeadlineExceeded) {
+			message = fmt.Sprintf("%v; browser fallback timed out, likely blocked by upstream challenge/anti-bot page", err)
+		}
+		return ndjsonParseResult{}, &inferenceTransportError{Message: message}
+	}
+	if c.Config.DebugUpstream {
+		log.Printf("[debug_upstream] runInferenceTranscript browser fallback body thread_id=%s bytes=%d", threadID, len(body))
+	}
+	if formatErr := detectInferenceStreamResponseFormat(body); formatErr != nil {
+		if c.Config.DebugUpstream {
+			log.Printf("[debug_upstream] runInferenceTranscript browser fallback rejected thread_id=%s err=%v", threadID, formatErr)
+		}
+		return ndjsonParseResult{}, formatErr
+	}
+	return consumeNDJSONStream(strings.NewReader(body), threadID, sink)
+}
+
 func (c *NotionAIClient) captureDebugUpstreamRequest(url string, headers map[string]string, payload map[string]any, body []byte) {
 	if !c.Config.DebugUpstream {
 		return
@@ -940,31 +1125,30 @@ func (c *NotionAIClient) buildDefaultWorkflowConfigValue(threadType string, useW
 	}
 	configValue := map[string]any{
 		"type":                                           threadType,
-		"enableAgentAutomations":                         false,
-		"enableAgentIntegrations":                        false,
-		"enableCustomAgents":                             false,
+		"enableAgentAutomations":                         true,
+		"enableAgentIntegrations":                        true,
+		"enableCustomAgents":                             true,
 		"enableExperimentalIntegrations":                 false,
-		"enableAgentViewNotificationsTool":               false,
-		"enableAgentDiffs":                               false,
+		"enableAgentDiffs":                               true,
 		"enableAgentUpdatePagePatch":                     enableUpstreamEdits,
-		"enableAgentCreateDbTemplate":                    false,
+		"enableAgentCreateDbTemplate":                    true,
 		"enableCsvAttachmentSupport":                     c.Config.Features.EnableCsvAttachmentSupport,
 		"enableDatabaseAgents":                           false,
+		"showDatabaseAgentsDiscoverability":              false,
 		"enableAgentThreadTools":                         false,
-		"enableRunAgentTool":                             false,
 		"enableCrdtOperations":                           false,
-		"enableAgentCardCustomization":                   false,
+		"enableAgentCardCustomization":                   true,
 		"enableSystemPromptAsPage":                       false,
 		"enableUserSessionContext":                       false,
 		"enableScriptAgentAdvanced":                      false,
-		"enableScriptAgent":                              false,
+		"enableScriptAgent":                              true,
 		"enableScriptAgentSearchConnectorsInCustomAgent": false,
 		"enableScriptAgentGoogleDriveInCustomAgent":      false,
-		"enableScriptAgentSlack":                         false,
+		"enableScriptAgentGoogleDriveOAuthInCustomAgent": false,
+		"enableScriptAgentSlack":                         true,
 		"enableScriptAgentMcpServers":                    false,
-		"enableScriptAgentMail":                          false,
-		"enableScriptAgentCalendar":                      false,
-		"enableScriptAgentCustomAgentTools":              false,
+		"enableScriptAgentMail":                          true,
+		"enableScriptAgentCalendar":                      true,
 		"enableScriptAgentCustomToolCalling":             false,
 		"enableCreateAndRunThread":                       true,
 		"enableSoftwareFactoryPage":                      false,
@@ -972,19 +1156,24 @@ func (c *NotionAIClient) buildDefaultWorkflowConfigValue(threadType string, useW
 		"enableSpeculativeSearch":                        false,
 		"enableQueryCalendar":                            false,
 		"enableQueryMail":                                false,
-		"enableMailExplicitToolCalls":                    false,
+		"enableMailExplicitToolCalls":                    true,
+		"enableMailNotificationPreferences":              false,
 		"enableMailAgentMultiProviderSupport":            false,
-		"useRulePrioritization":                          false,
+		"useRulePrioritization":                          true,
 		"availableConnectors":                            []any{},
 		"customConnectorInfo":                            []any{},
 		"searchScopes":                                   searchScopes,
 		"useSearchToolV2":                                false,
+		"enableUnifiedSearch":                            false,
 		"useWebSearch":                                   useWebSearch,
+		"isHipaa":                                        false,
+		"yoloMode":                                       false,
 		"useReadOnlyMode":                                readOnly,
 		"writerMode":                                     c.Config.Features.WriterMode && !readOnly,
 		"modelFromUser":                                  strings.TrimSpace(notionModel) != "",
 		"isCustomAgent":                                  false,
 		"isCustomAgentBuilder":                           false,
+		"isAgentResearchRequest":                         false,
 		"useCustomAgentDraft":                            false,
 		"use_draft_actor_pointer":                        false,
 		"enableUpdatePageAutofixer":                      enableUpstreamEdits,
@@ -992,9 +1181,13 @@ func (c *NotionAIClient) buildDefaultWorkflowConfigValue(threadType string, useW
 		"enableUpdatePageOrderUpdates":                   enableUpstreamEdits,
 		"enableAgentSupportPropertyReorder":              enableUpstreamEdits,
 		"agentShortUpdatePageResult":                     false,
-		"enableAgentAskSurvey":                           false,
+		"enableAgentAskSurvey":                           true,
 		"databaseAgentConfigMode":                        false,
 		"isOnboardingAgent":                              false,
+		"isMobile":                                       false,
+	}
+	if clean := strings.TrimSpace(notionModel); clean != "" {
+		configValue["model"] = clean
 	}
 	return configValue
 }
@@ -1406,25 +1599,46 @@ func mergeContinuationDraft(preferred *continuationTurnDraft, live *continuation
 }
 
 func finalAgentFromRecordMap(recordMap map[string]any, threadID string) ([]string, agentMessage, bool) {
+	messageIDs, lastAgent, outcomeErr, ok := finalThreadOutcomeFromRecordMap(recordMap, threadID)
+	if !ok || outcomeErr != nil {
+		return messageIDs, agentMessage{}, false
+	}
+	return messageIDs, lastAgent, true
+}
+
+func finalThreadOutcomeFromRecordMap(recordMap map[string]any, threadID string) ([]string, agentMessage, error, bool) {
 	messageIDs := messageIDsFromRecordMap(recordMap, threadID)
 	if len(messageIDs) == 0 {
-		return nil, agentMessage{}, false
+		return nil, agentMessage{}, nil, false
 	}
 	agentMap := extractAgentMessages(recordMap)
+	errorMap := extractThreadErrors(recordMap, threadID)
 	var lastAgent agentMessage
-	var haveAgent bool
+	var lastErr error
+	var haveOutcome bool
 	for _, messageID := range messageIDs {
+		if stepErr, ok := errorMap[messageID]; ok {
+			copyErr := stepErr
+			lastErr = &copyErr
+			lastAgent = agentMessage{}
+			haveOutcome = true
+			continue
+		}
 		msg, ok := agentMap[messageID]
 		if !ok {
 			continue
 		}
 		lastAgent = msg
-		haveAgent = true
+		lastErr = nil
+		haveOutcome = true
 	}
-	if !haveAgent {
-		return messageIDs, agentMessage{}, false
+	if !haveOutcome {
+		return messageIDs, agentMessage{}, nil, false
 	}
-	return messageIDs, lastAgent, true
+	if lastErr != nil {
+		return messageIDs, agentMessage{}, lastErr, true
+	}
+	return messageIDs, lastAgent, nil, true
 }
 
 func parsePatchStepIndex(path string) (int, string, bool) {
@@ -2025,11 +2239,14 @@ func (s *ndjsonTranscriptState) handleLine(line []byte, threadID string, sink In
 		}
 		return s.mergeAgentInferenceEvent(event, sink)
 	case "record-map":
-		messageIDs := messageIDsFromRecordMap(envelope.RecordMap, threadID)
+		messageIDs, agent, outcomeErr, ok := finalThreadOutcomeFromRecordMap(envelope.RecordMap, threadID)
 		if len(messageIDs) > 0 {
 			s.MessageIDs = messageIDs
 		}
-		if _, agent, ok := finalAgentFromRecordMap(envelope.RecordMap, threadID); ok {
+		if outcomeErr != nil {
+			return outcomeErr
+		}
+		if ok {
 			return s.mergeFinalAgent(agent, sink)
 		}
 	}
@@ -2184,7 +2401,10 @@ func (c *NotionAIClient) loadFinalAnswerOnce(ctx context.Context, threadID strin
 		return nil, agentMessage{}, err
 	}
 	recordMap := mapValue(messageData["recordMap"])
-	if _, agent, ok := finalAgentFromRecordMap(recordMap, threadID); ok {
+	if _, agent, outcomeErr, ok := finalThreadOutcomeFromRecordMap(recordMap, threadID); ok {
+		if outcomeErr != nil {
+			return messageIDs, agentMessage{}, outcomeErr
+		}
 		return messageIDs, agent, nil
 	}
 	return messageIDs, agentMessage{}, fmt.Errorf("thread %s did not produce any agent-inference message", threadID)
@@ -2360,6 +2580,32 @@ func extractAgentMessages(recordMap map[string]any) map[string]agentMessage {
 	return out
 }
 
+func extractThreadErrors(recordMap map[string]any, threadID string) map[string]inferenceStepError {
+	out := map[string]inferenceStepError{}
+	threadMessages := mapValue(recordMap["thread_message"])
+	for messageID, rawItem := range threadMessages {
+		item := mapValue(rawItem)
+		valueWrapper := mapValue(item["value"])
+		value := mapValue(valueWrapper["value"])
+		step := mapValue(value["step"])
+		if stringValue(step["type"]) != "error" {
+			continue
+		}
+		data := mapValue(value["data"])
+		traceID := firstNonEmpty(strings.TrimSpace(stringValue(step["traceId"])), strings.TrimSpace(stringValue(data["inference_id"])))
+		out[messageID] = inferenceStepError{
+			ThreadID:   strings.TrimSpace(threadID),
+			MessageID:  messageID,
+			Message:    strings.TrimSpace(stringValue(step["message"])),
+			SubType:    strings.TrimSpace(stringValue(step["subType"])),
+			TraceID:    traceID,
+			Retryable:  booleanValue(step["isRetryable"]),
+			StackTrace: strings.TrimSpace(stringValue(step["stack"])),
+		}
+	}
+	return out
+}
+
 func (c *NotionAIClient) loadTranscriptConversation(ctx context.Context, summary InferenceTranscriptSummary) (ConversationEntry, error) {
 	threadID := strings.TrimSpace(summary.ThreadID)
 	if threadID == "" {
@@ -2516,13 +2762,12 @@ func (c *NotionAIClient) pollFinalAnswer(ctx context.Context, threadID string) (
 			return nil, agentMessage{}, err
 		}
 		recordMap := mapValue(messageData["recordMap"])
-		agentMap := extractAgentMessages(recordMap)
-		for _, messageID := range messageIDs {
-			msg, ok := agentMap[messageID]
-			if !ok {
-				continue
-			}
-			lastAgent = msg
+		_, agent, outcomeErr, ok := finalThreadOutcomeFromRecordMap(recordMap, threadID)
+		if outcomeErr != nil {
+			return messageIDs, agentMessage{}, outcomeErr
+		}
+		if ok {
+			lastAgent = agent
 			haveAgent = true
 		}
 		if haveAgent && lastAgent.Completed && strings.TrimSpace(lastAgent.Text) != "" {
@@ -2957,9 +3202,28 @@ func (c *NotionAIClient) markInferenceTranscriptSeen(ctx context.Context, thread
 		return nil
 	}
 	_, err := c.postJSON(ctx, c.Config.NotionUpstream().API("markInferenceTranscriptSeen"), map[string]any{
+		"spaceId":  c.Session.SpaceID,
 		"threadId": threadID,
 	}, "application/json")
 	return err
+}
+
+func (c *NotionAIClient) logBestEffortFailure(operation string, err error) {
+	if err == nil || !c.Config.DebugUpstream {
+		return
+	}
+	log.Printf("[best_effort] %s: %v", operation, err)
+}
+
+func (c *NotionAIClient) markInferenceTranscriptSeenBestEffort(ctx context.Context, threadID string) {
+	bestEffortCtx, cancel, ok := bestEffortContext(ctx, bestEffortPostRunTimeout)
+	if !ok {
+		return
+	}
+	defer cancel()
+	if err := c.markInferenceTranscriptSeen(bestEffortCtx, threadID); err != nil {
+		c.logBestEffortFailure("markInferenceTranscriptSeen", err)
+	}
 }
 
 func (c *NotionAIClient) prepareContinuationDraftFromThread(ctx context.Context, threadID string) (*continuationTurnDraft, error) {
@@ -3093,7 +3357,6 @@ func (c *NotionAIClient) saveContinuationScaffold(ctx context.Context, threadID 
 				},
 			},
 		},
-		"unretryable_error_behavior": "continue",
 	}
 	if _, err := c.postJSON(ctx, c.Config.NotionUpstream().API("saveTransactionsFanout"), payload, "application/json"); err != nil {
 		return nil, err
@@ -3107,32 +3370,7 @@ func (c *NotionAIClient) saveContinuationScaffold(ctx context.Context, threadID 
 }
 
 func (c *NotionAIClient) streamRunInferenceTranscript(ctx context.Context, payload map[string]any, threadID string, sink InferenceStreamSink, _ bool) (ndjsonParseResult, error) {
-	resp, err := c.postJSONResponse(ctx, c.Config.NotionUpstream().API("runInferenceTranscript"), payload, "application/x-ndjson")
-	if err != nil {
-		return ndjsonParseResult{}, err
-	}
-	defer resp.Body.Close()
-
-	stopKeepAlive := make(chan struct{})
-	defer close(stopKeepAlive)
-	if sink.KeepAlive != nil {
-		go func() {
-			ticker := time.NewTicker(10 * time.Second)
-			defer ticker.Stop()
-			for {
-				select {
-				case <-ctx.Done():
-					return
-				case <-stopKeepAlive:
-					return
-				case <-ticker.C:
-					_ = sink.EmitKeepAlive()
-				}
-			}
-		}()
-	}
-
-	return consumeNDJSONStreamWithIdleClose(resp.Body, threadID, sink, ndjsonIdleAfterAnswerTimeout)
+	return c.runInferenceTranscriptWithFallback(ctx, payload, threadID, sink)
 }
 
 func (c *NotionAIClient) buildInferencePayload(req PromptRunRequest, threadID string, attachments []UploadedAttachment) (map[string]any, inferencePayloadMeta) {
@@ -3294,6 +3532,7 @@ func (c *NotionAIClient) buildInferencePayload(req PromptRunRequest, threadID st
 		"isPartialTranscript":           req.continuationDraft != nil,
 		"saveAllThreadOperations":       !req.SuppressUpstreamThreadPersistence,
 		"setUnreadState":                true,
+		"createdSource":                 surface,
 		"isUserInAnySalesAssistedSpace": false,
 		"isSpaceSalesAssisted":          false,
 	}
@@ -3302,15 +3541,6 @@ func (c *NotionAIClient) buildInferencePayload(req PromptRunRequest, threadID st
 		"cachedInferences":                map[string]any{},
 		"emitAgentSearchExtractedResults": true,
 		"emitInferences":                  false,
-	}
-	if strings.TrimSpace(req.NotionModel) != "" {
-		payload["debugOverrides"] = map[string]any{
-			"annotationInferences":            map[string]any{},
-			"cachedInferences":                map[string]any{},
-			"model":                           strings.TrimSpace(req.NotionModel),
-			"emitAgentSearchExtractedResults": true,
-			"emitInferences":                  false,
-		}
 	}
 	if strings.TrimSpace(req.UpstreamThreadID) == "" && !req.attachmentThreadReady {
 		payload["threadParentPointer"] = map[string]any{
@@ -3359,9 +3589,15 @@ func (c *NotionAIClient) preparePromptRequest(ctx context.Context, req PromptRun
 		continuationDraft:                 req.continuationDraft,
 	}
 	if strings.TrimSpace(preparedReq.UpstreamThreadID) != "" {
-		draft, draftErr := c.prepareContinuationDraftFromThread(ctx, preparedReq.UpstreamThreadID)
-		if draftErr == nil {
-			preparedReq.continuationDraft = mergeContinuationDraft(preparedReq.continuationDraft, draft)
+		bestEffortCtx, cancel, ok := bestEffortContext(ctx, bestEffortUpstreamTimeout)
+		if ok {
+			draft, draftErr := c.prepareContinuationDraftFromThread(bestEffortCtx, preparedReq.UpstreamThreadID)
+			cancel()
+			if draftErr == nil {
+				preparedReq.continuationDraft = mergeContinuationDraft(preparedReq.continuationDraft, draft)
+			} else {
+				c.logBestEffortFailure("prepareContinuationDraftFromThread", draftErr)
+			}
 		}
 	}
 	if strings.TrimSpace(preparedReq.UpstreamThreadID) != "" {
@@ -3425,13 +3661,12 @@ func (c *NotionAIClient) pollFinalAnswerStream(ctx context.Context, threadID str
 			return nil, agentMessage{}, err
 		}
 		recordMap := mapValue(messageData["recordMap"])
-		agentMap := extractAgentMessages(recordMap)
-		for _, messageID := range messageIDs {
-			msg, ok := agentMap[messageID]
-			if !ok {
-				continue
-			}
-			lastAgent = msg
+		_, agent, outcomeErr, ok := finalThreadOutcomeFromRecordMap(recordMap, threadID)
+		if outcomeErr != nil {
+			return messageIDs, agentMessage{}, outcomeErr
+		}
+		if ok {
+			lastAgent = agent
 			haveAgent = true
 		}
 		if haveAgent && strings.TrimSpace(lastAgent.Text) != "" {
@@ -3459,15 +3694,21 @@ func (c *NotionAIClient) RunPrompt(ctx context.Context, req PromptRunRequest) (I
 		return InferenceResult{}, err
 	}
 	traceID := stringValue(payload["traceId"])
-	resp, err := c.postJSONResponse(ctx, c.Config.NotionUpstream().API("runInferenceTranscript"), payload, "application/x-ndjson")
-	if err != nil {
-		return InferenceResult{}, err
-	}
-	defer resp.Body.Close()
-	parsed, parseErr := consumeNDJSONStreamWithIdleClose(resp.Body, actualThreadID, InferenceStreamSink{}, ndjsonIdleAfterAnswerTimeout)
+	parsed, parseErr := c.runInferenceTranscriptWithFallback(ctx, payload, actualThreadID, InferenceStreamSink{})
 	messageIDs := parsed.MessageIDs
 	finalAgent := parsed.FinalAgent
 	if strings.TrimSpace(finalAgent.Text) == "" {
+		var stepErr *inferenceStepError
+		var transportErr *inferenceTransportError
+		if parseErr != nil && errors.As(parseErr, &stepErr) {
+			return InferenceResult{}, stepErr
+		}
+		if parseErr != nil && errors.As(parseErr, &transportErr) {
+			return InferenceResult{}, transportErr
+		}
+		if parseErr != nil && parsed.LineCount == 0 && len(parsed.MessageIDs) == 0 {
+			return InferenceResult{}, parseErr
+		}
 		messageIDs, finalAgent, err = c.loadFinalAnswerOnce(ctx, actualThreadID)
 		if err != nil {
 			messageIDs, finalAgent, err = c.pollFinalAnswer(ctx, actualThreadID)
@@ -3486,7 +3727,7 @@ func (c *NotionAIClient) RunPrompt(ctx context.Context, req PromptRunRequest) (I
 	}
 	lineCount := parsed.LineCount
 	if strings.TrimSpace(req.UpstreamThreadID) != "" && !req.SuppressUpstreamThreadPersistence {
-		_ = c.markInferenceTranscriptSeen(ctx, actualThreadID)
+		c.markInferenceTranscriptSeenBestEffort(ctx, actualThreadID)
 	}
 	return InferenceResult{
 		Prompt:           cleanPrompt,
@@ -3520,6 +3761,13 @@ func (c *NotionAIClient) RunPromptStreamWithSink(ctx context.Context, req Prompt
 
 	parsed, err := c.streamRunInferenceTranscript(ctx, payload, actualThreadID, sink, req.StreamReasoningWarmup)
 	if err != nil {
+		var transportErr *inferenceTransportError
+		if errors.As(err, &transportErr) {
+			return InferenceResult{}, transportErr
+		}
+		if parsed.LineCount == 0 && len(parsed.MessageIDs) == 0 {
+			return InferenceResult{}, err
+		}
 		return InferenceResult{}, err
 	}
 	messageIDs := parsed.MessageIDs
@@ -3537,7 +3785,7 @@ func (c *NotionAIClient) RunPromptStreamWithSink(ctx context.Context, req Prompt
 		return InferenceResult{}, fmt.Errorf("thread %s finished without final text", actualThreadID)
 	}
 	if strings.TrimSpace(req.UpstreamThreadID) != "" && !req.SuppressUpstreamThreadPersistence {
-		_ = c.markInferenceTranscriptSeen(ctx, actualThreadID)
+		c.markInferenceTranscriptSeenBestEffort(ctx, actualThreadID)
 	}
 	return InferenceResult{
 		Prompt:           cleanPrompt,

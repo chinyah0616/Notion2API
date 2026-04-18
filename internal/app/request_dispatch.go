@@ -2,6 +2,7 @@ package app
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"strings"
@@ -105,6 +106,16 @@ func dispatchProtocolProbeTimeout(cfg AppConfig) time.Duration {
 	return time.Duration(seconds) * time.Second
 }
 
+func isDispatchContextAbort(ctx context.Context, err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+	return ctx != nil && ctx.Err() != nil
+}
+
 func (a *App) probeAccountProtocolHealth(ctx context.Context, cfg AppConfig, session SessionInfo) error {
 	if a.accountProtocolProbeOverride != nil {
 		return a.accountProtocolProbeOverride(ctx, cfg, session)
@@ -113,6 +124,9 @@ func (a *App) probeAccountProtocolHealth(ctx context.Context, cfg AppConfig, ses
 	defer cancel()
 	client := newNotionAIClient(session, cfg)
 	_, err := client.listInferenceTranscripts(probeCtx)
+	if isDispatchContextAbort(probeCtx, err) {
+		return nil
+	}
 	return err
 }
 
@@ -307,6 +321,9 @@ func (a *App) runPromptWithAccountPool(r *http.Request, request PromptRunRequest
 			}
 			err = runErr
 		}
+		if isDispatchContextAbort(ctx, err) {
+			return InferenceResult{}, err
+		}
 
 		retryable := isSessionRetryableError(err)
 		if retryable && cfg.ResolveSessionRefresh().Enabled && !emittedAny {
@@ -346,6 +363,9 @@ func (a *App) runPromptWithAccountPool(r *http.Request, request PromptRunRequest
 					retryable = isSessionRetryableError(err)
 				}
 			}
+		}
+		if isDispatchContextAbort(ctx, err) {
+			return InferenceResult{}, err
 		}
 
 		if retryable {
@@ -435,6 +455,9 @@ func (a *App) runPromptWithAccountPoolWithSink(r *http.Request, request PromptRu
 			}
 			err = runErr
 		}
+		if isDispatchContextAbort(ctx, err) {
+			return InferenceResult{}, err
+		}
 
 		retryable := isSessionRetryableError(err)
 		if retryable && cfg.ResolveSessionRefresh().Enabled && !emittedAny {
@@ -478,6 +501,9 @@ func (a *App) runPromptWithAccountPoolWithSink(r *http.Request, request PromptRu
 					retryable = isSessionRetryableError(err)
 				}
 			}
+		}
+		if isDispatchContextAbort(ctx, err) {
+			return InferenceResult{}, err
 		}
 
 		if retryable {

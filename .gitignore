@@ -20,12 +20,14 @@ Thumbs.db
 *.db
 *.db-shm
 *.db-wal
+tmp_last_*
 /notion2api
 /notion2api-linux-amd64
 _tmp_login_check/
 _tmp_app_bundle.js
 _ui_preview_server.cjs
 _admin_preview_base64.txt
+node_modules/
 frontend/node_modules/
 frontend/.next/
 frontend/out/

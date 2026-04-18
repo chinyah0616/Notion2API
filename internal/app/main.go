@@ -793,7 +793,7 @@ func (a *App) resolveContinuationConversation(r *http.Request, payload map[strin
 		if entry, ok := a.State.conversations().Get(explicitConversationID); ok && strings.TrimSpace(entry.ThreadID) != "" {
 			state, err := a.State.loadConversationContinuationStateByConversationID(entry.ID)
 			if err == nil && !validateState(state) {
-				return continuationTarget{}, false
+				return continuationTarget{Conversation: entry}, true
 			}
 			if err == nil {
 				return continuationTarget{Conversation: entry, Session: state}, true
@@ -802,7 +802,12 @@ func (a *App) resolveContinuationConversation(r *http.Request, payload map[strin
 		}
 		if state, err := a.State.loadConversationContinuationStateByConversationID(explicitConversationID); err == nil && state != nil {
 			if !validateState(state) {
-				return continuationTarget{}, false
+				entry := ConversationEntry{
+					ID:           strings.TrimSpace(state.Session.ConversationID),
+					ThreadID:     strings.TrimSpace(state.Session.ThreadID),
+					AccountEmail: strings.TrimSpace(state.Session.AccountEmail),
+				}
+				return continuationTarget{Conversation: entry}, true
 			}
 			entry := ConversationEntry{
 				ID:           strings.TrimSpace(state.Session.ConversationID),
@@ -1543,6 +1548,14 @@ func (a *App) writeChatCompletionLiveStream(w http.ResponseWriter, r *http.Reque
 			return
 		}
 		a.failConversation(conversationID, err)
+		_ = safeWriteData(map[string]any{
+			"error": map[string]any{
+				"message": err.Error(),
+				"type":    "api_error",
+				"param":   nil,
+				"code":    "upstream_error",
+			},
+		})
 		safeWriteDone()
 		return
 	}
