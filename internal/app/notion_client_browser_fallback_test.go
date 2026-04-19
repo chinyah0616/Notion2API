@@ -286,6 +286,45 @@ func TestRunPromptBrowserFallbackUsesFullParentBudget(t *testing.T) {
 	}
 }
 
+func TestRunPromptReturnsClearClientCanceledBrowserFallbackError(t *testing.T) {
+	const trustMessageID = "msg-trust-canceled"
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/v3/runInferenceTranscript" {
+			t.Fatalf("unexpected path: %s", r.URL.Path)
+		}
+		var payload map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			t.Fatalf("decode payload failed: %v", err)
+		}
+		threadID := strings.TrimSpace(stringValue(payload["threadId"]))
+		if threadID == "" {
+			t.Fatalf("runInference payload missing threadId")
+		}
+		w.Header().Set("Content-Type", "application/x-ndjson")
+		_, _ = w.Write([]byte(buildTrustRuleDeniedResponse(t, threadID, trustMessageID, "trust-rule-denied")))
+	}))
+	defer server.Close()
+
+	client := newBrowserFallbackTestClient(server.URL)
+	client.browserRunInferenceFallback = func(ctx context.Context, payload map[string]any) (string, error) {
+		return "", context.Canceled
+	}
+
+	_, err := client.RunPrompt(context.Background(), PromptRunRequest{
+		Prompt:       "hello",
+		PublicModel:  "opus-4.7",
+		NotionModel:  "apricot-sorbet-medium",
+		UseWebSearch: false,
+	})
+	if err == nil {
+		t.Fatalf("expected browser fallback cancellation error")
+	}
+	if !strings.Contains(err.Error(), "request was canceled by caller/client before browser fallback completed") {
+		t.Fatalf("expected clear canceled message, got %v", err)
+	}
+}
+
 func TestBrowserFallbackTimeoutForPayloadScalesWithPayloadSize(t *testing.T) {
 	small := browserFallbackTimeoutForPayload(context.Background(), map[string]any{
 		"prompt": "short",

@@ -1082,10 +1082,8 @@ func (c *NotionAIClient) runInferenceTranscriptWithFallback(ctx context.Context,
 	body, fallbackErr := runFallback(fallbackCtx, payload)
 	if fallbackErr != nil {
 		c.logBestEffortFailure("runInferenceTranscriptInBrowser", fallbackErr)
-		message := fmt.Sprintf("%v; browser fallback failed: %v", err, fallbackErr)
-		if errors.Is(fallbackErr, context.DeadlineExceeded) {
-			message = fmt.Sprintf("%v; browser fallback timed out after %s before response stream completed (payload_bytes=%d)", err, fallbackTimeout, payloadBytes)
-		}
+		c.logRunInferenceTranscriptBrowserFallbackFailure(threadID, fallbackTimeout, payloadBytes, fallbackErr)
+		message := formatRunInferenceTranscriptBrowserFallbackError(err, fallbackErr, fallbackTimeout, payloadBytes)
 		return ndjsonParseResult{}, &inferenceTransportError{Message: message}
 	}
 	if c.Config.DebugUpstream {
@@ -1098,6 +1096,31 @@ func (c *NotionAIClient) runInferenceTranscriptWithFallback(ctx context.Context,
 		return ndjsonParseResult{}, formatErr
 	}
 	return consumeNDJSONStream(strings.NewReader(body), threadID, sink)
+}
+
+func formatRunInferenceTranscriptBrowserFallbackError(upstreamErr error, fallbackErr error, fallbackTimeout time.Duration, payloadBytes int) string {
+	switch {
+	case errors.Is(fallbackErr, context.DeadlineExceeded):
+		return fmt.Sprintf("%v; browser fallback timed out after %s before response stream completed (payload_bytes=%d)", upstreamErr, fallbackTimeout, payloadBytes)
+	case errors.Is(fallbackErr, context.Canceled):
+		return fmt.Sprintf("%v; request was canceled by caller/client before browser fallback completed (payload_bytes=%d)", upstreamErr, payloadBytes)
+	default:
+		return fmt.Sprintf("%v; browser fallback failed: %v", upstreamErr, fallbackErr)
+	}
+}
+
+func (c *NotionAIClient) logRunInferenceTranscriptBrowserFallbackFailure(threadID string, fallbackTimeout time.Duration, payloadBytes int, fallbackErr error) {
+	if !c.Config.DebugUpstream || fallbackErr == nil {
+		return
+	}
+	switch {
+	case errors.Is(fallbackErr, context.DeadlineExceeded):
+		log.Printf("[debug_upstream] runInferenceTranscript browser fallback timed out thread_id=%s timeout=%s payload_bytes=%d err=%v", threadID, fallbackTimeout, payloadBytes, fallbackErr)
+	case errors.Is(fallbackErr, context.Canceled):
+		log.Printf("[debug_upstream] runInferenceTranscript browser fallback canceled thread_id=%s payload_bytes=%d reason=caller/client canceled request err=%v", threadID, payloadBytes, fallbackErr)
+	default:
+		log.Printf("[debug_upstream] runInferenceTranscript browser fallback failed thread_id=%s timeout=%s payload_bytes=%d err=%v", threadID, fallbackTimeout, payloadBytes, fallbackErr)
+	}
 }
 
 func (c *NotionAIClient) captureDebugUpstreamRequest(url string, headers map[string]string, payload map[string]any, body []byte) {
