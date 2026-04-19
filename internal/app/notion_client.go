@@ -22,11 +22,15 @@ import (
 )
 
 const (
-	maxAttachmentBytes              = 20 * 1024 * 1024
-	bestEffortUpstreamTimeout       = 5 * time.Second
-	bestEffortPostRunTimeout        = 3 * time.Second
-	browserFallbackTimeout          = 30 * time.Second
-	bestEffortBudgetDivisor   int64 = 4
+	maxAttachmentBytes                    = 20 * 1024 * 1024
+	bestEffortUpstreamTimeout             = 5 * time.Second
+	bestEffortPostRunTimeout              = 3 * time.Second
+	browserFallbackTimeout                = 60 * time.Second
+	browserFallbackTimeoutMax             = 120 * time.Second
+	browserFallbackTimeoutStep            = 5 * time.Second
+	browserFallbackTimeoutStepBytes       = 4 * 1024
+	browserFallbackTimeoutThreshold       = 12 * 1024
+	bestEffortBudgetDivisor         int64 = 4
 )
 
 var leadingLangTagPattern = regexp.MustCompile(`(?is)^\s*(?:<lang\b[^>]*>|</lang>)\s*`)
@@ -56,6 +60,52 @@ func bestEffortTimeout(parent context.Context, cap time.Duration) time.Duration 
 		}
 	}
 	return cap
+}
+
+func boundedTimeout(parent context.Context, cap time.Duration) time.Duration {
+	if cap <= 0 {
+		return 0
+	}
+	if parent == nil {
+		return cap
+	}
+	if err := parent.Err(); err != nil {
+		return 0
+	}
+	if deadline, ok := parent.Deadline(); ok {
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			return 0
+		}
+		if remaining < cap {
+			cap = remaining
+		}
+	}
+	return cap
+}
+
+func browserFallbackPayloadBytes(payload map[string]any) int {
+	if len(payload) == 0 {
+		return 0
+	}
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return 0
+	}
+	return len(body)
+}
+
+func browserFallbackTimeoutForPayload(parent context.Context, payload map[string]any) time.Duration {
+	timeout := browserFallbackTimeout
+	if payloadBytes := browserFallbackPayloadBytes(payload); payloadBytes > browserFallbackTimeoutThreshold {
+		extraBytes := payloadBytes - browserFallbackTimeoutThreshold
+		extraSteps := (extraBytes + browserFallbackTimeoutStepBytes - 1) / browserFallbackTimeoutStepBytes
+		timeout += time.Duration(extraSteps) * browserFallbackTimeoutStep
+		if timeout > browserFallbackTimeoutMax {
+			timeout = browserFallbackTimeoutMax
+		}
+	}
+	return boundedTimeout(parent, timeout)
 }
 
 func bestEffortContext(parent context.Context, cap time.Duration) (context.Context, context.CancelFunc, bool) {
@@ -1018,21 +1068,23 @@ func (c *NotionAIClient) runInferenceTranscriptWithFallback(ctx context.Context,
 	if runFallback == nil {
 		runFallback = c.runInferenceTranscriptInBrowser
 	}
+	fallbackTimeout := browserFallbackTimeoutForPayload(ctx, payload)
+	payloadBytes := browserFallbackPayloadBytes(payload)
 	fallbackCtx := ctx
 	fallbackCancel := func() {}
-	if timeout := bestEffortTimeout(ctx, browserFallbackTimeout); timeout > 0 {
-		fallbackCtx, fallbackCancel = context.WithTimeout(ctx, timeout)
+	if fallbackTimeout > 0 {
+		fallbackCtx, fallbackCancel = context.WithTimeout(ctx, fallbackTimeout)
 	}
 	defer fallbackCancel()
 	if c.Config.DebugUpstream {
-		log.Printf("[debug_upstream] runInferenceTranscript browser fallback start thread_id=%s", threadID)
+		log.Printf("[debug_upstream] runInferenceTranscript browser fallback start thread_id=%s timeout=%s payload_bytes=%d", threadID, fallbackTimeout, payloadBytes)
 	}
 	body, fallbackErr := runFallback(fallbackCtx, payload)
 	if fallbackErr != nil {
 		c.logBestEffortFailure("runInferenceTranscriptInBrowser", fallbackErr)
 		message := fmt.Sprintf("%v; browser fallback failed: %v", err, fallbackErr)
 		if errors.Is(fallbackErr, context.DeadlineExceeded) {
-			message = fmt.Sprintf("%v; browser fallback timed out, likely blocked by upstream challenge/anti-bot page", err)
+			message = fmt.Sprintf("%v; browser fallback timed out after %s before response stream completed (payload_bytes=%d)", err, fallbackTimeout, payloadBytes)
 		}
 		return ndjsonParseResult{}, &inferenceTransportError{Message: message}
 	}

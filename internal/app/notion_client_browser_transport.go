@@ -13,9 +13,6 @@ import (
 	"runtime"
 	"strings"
 	"time"
-
-	"github.com/chromedp/cdproto/network"
-	"github.com/chromedp/chromedp"
 )
 
 const (
@@ -320,6 +317,10 @@ type browserHelperUnavailableError struct {
 	Message string
 }
 
+var (
+	runPlaywrightBrowserFallback = runInferenceTranscriptInBrowserWithPlaywright
+)
+
 func (e *browserHelperUnavailableError) Error() string {
 	if e == nil {
 		return ""
@@ -354,20 +355,7 @@ func runInferenceTranscriptInBrowser(ctx context.Context, client *NotionAIClient
 	if len(client.Session.Cookies) == 0 {
 		return "", fmt.Errorf("browser transport requires session cookies")
 	}
-
-	if responseText, err := runInferenceTranscriptInBrowserWithPlaywright(ctx, client, payload); err == nil {
-		return responseText, nil
-	} else {
-		if responseText, chromedpErr := runInferenceTranscriptInBrowserWithChromedp(ctx, client, payload); chromedpErr == nil {
-			return responseText, nil
-		} else {
-			var unavailableErr *browserHelperUnavailableError
-			if errors.As(err, &unavailableErr) {
-				return "", fmt.Errorf("playwright browser fallback unavailable (%v); chromedp fallback failed: %w", err, chromedpErr)
-			}
-			return "", fmt.Errorf("playwright browser fallback failed: %v; chromedp fallback failed: %w", err, chromedpErr)
-		}
-	}
+	return runPlaywrightBrowserFallback(ctx, client, payload)
 }
 
 func runInferenceTranscriptInBrowserWithPlaywright(ctx context.Context, client *NotionAIClient, payload map[string]any) (string, error) {
@@ -463,7 +451,7 @@ func runPlaywrightBrowserHelper(ctx context.Context, runtimeName string, extensi
 	cmd.Stderr = &stderr
 
 	if err := cmd.Run(); err != nil {
-		return "", classifyBrowserHelperExecError(runtimeName, err, stderr.String())
+		return "", classifyBrowserHelperExecError(ctx, runtimeName, err, stderr.String())
 	}
 
 	var response browserTransportResponse
@@ -479,9 +467,14 @@ func runPlaywrightBrowserHelper(ctx context.Context, runtimeName string, extensi
 	return response.Text, nil
 }
 
-func classifyBrowserHelperExecError(runtimeName string, runErr error, stderrText string) error {
+func classifyBrowserHelperExecError(ctx context.Context, runtimeName string, runErr error, stderrText string) error {
 	if errors.Is(runErr, exec.ErrNotFound) {
 		return &browserHelperUnavailableError{Message: fmt.Sprintf("%s not found", runtimeName)}
+	}
+	if ctx != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return ctxErr
+		}
 	}
 	trimmed := strings.TrimSpace(stderrText)
 	lower := strings.ToLower(trimmed)
@@ -615,58 +608,6 @@ func splitPathListCandidates(values []string) []string {
 	return candidates
 }
 
-func runInferenceTranscriptInBrowserWithChromedp(ctx context.Context, client *NotionAIClient, payload map[string]any) (string, error) {
-	allocatorOptions := append([]chromedp.ExecAllocatorOption{}, chromedp.DefaultExecAllocatorOptions[:]...)
-	allocatorOptions = append(allocatorOptions,
-		chromedp.Flag("headless", true),
-		chromedp.Flag("no-sandbox", true),
-		chromedp.Flag("disable-gpu", true),
-		chromedp.Flag("disable-dev-shm-usage", true),
-		chromedp.Flag("ignore-certificate-errors", true),
-	)
-	if browserPath := resolveBrowserExecutablePath(); browserPath != "" {
-		allocatorOptions = append(allocatorOptions, chromedp.ExecPath(browserPath))
-	}
-
-	allocCtx, cancelAlloc := chromedp.NewExecAllocator(ctx, allocatorOptions...)
-	defer cancelAlloc()
-
-	browserCtx, cancelBrowser := chromedp.NewContext(allocCtx)
-	defer cancelBrowser()
-
-	originURL := firstNonEmpty(strings.TrimSpace(client.Config.NotionUpstream().OriginURL), strings.TrimSpace(client.Config.NotionUpstream().BaseURL))
-	if originURL == "" {
-		originURL = "https://www.notion.so"
-	}
-	aiURL := client.Config.NotionUpstream().AIURL()
-
-	request, err := buildBrowserTransportRequest(client, payload)
-	if err != nil {
-		return "", err
-	}
-	inputPayload, err := json.Marshal(request)
-	if err != nil {
-		return "", err
-	}
-	expression := fmt.Sprintf("(%s)(%s)", browserTransportFetchPageScript, string(inputPayload))
-
-	var response browserTransportResponse
-	if err := chromedp.Run(browserCtx,
-		network.Enable(),
-		setBrowserSessionCookies(originURL, client.Session.Cookies),
-		chromedp.Navigate(aiURL),
-		chromedp.WaitReady("body", chromedp.ByQuery),
-		chromedp.Sleep(browserTransportBootstrapDelay),
-		chromedp.Evaluate(expression, &response),
-	); err != nil {
-		return "", err
-	}
-	if strings.TrimSpace(response.Text) == "" {
-		return "", fmt.Errorf("browser transport returned empty response")
-	}
-	return response.Text, nil
-}
-
 func (c *NotionAIClient) supportsBrowserRunInferenceFallback() bool {
 	if c == nil {
 		return false
@@ -693,44 +634,8 @@ func (c *NotionAIClient) supportsBrowserRunInferenceFallback() bool {
 	return true
 }
 
-func setBrowserSessionCookies(originURL string, cookies []ProbeCookie) chromedp.Action {
-	return chromedp.ActionFunc(func(ctx context.Context) error {
-		if len(cookies) == 0 {
-			return nil
-		}
-		parsed, err := url.Parse(originURL)
-		if err != nil {
-			return err
-		}
-		hostURL := parsed.Scheme + "://" + parsed.Host
-		for _, item := range cookies {
-			name := strings.TrimSpace(item.Name)
-			if name == "" {
-				continue
-			}
-			err := network.SetCookie(name, item.Value).
-				WithURL(hostURL).
-				WithPath("/").
-				Do(ctx)
-			if err != nil {
-				return err
-			}
-		}
-		return nil
-	})
-}
-
 func resolvePlaywrightBrowserExecutablePath() string {
 	for _, candidate := range []string{os.Getenv("CHROME_BIN"), os.Getenv("CHROMIUM_BIN")} {
-		if resolved := resolveExecutableCandidate(candidate); resolved != "" {
-			return resolved
-		}
-	}
-	return ""
-}
-
-func resolveBrowserExecutablePath() string {
-	for _, candidate := range browserExecutableCandidates() {
 		if resolved := resolveExecutableCandidate(candidate); resolved != "" {
 			return resolved
 		}
@@ -753,28 +658,4 @@ func resolveExecutableCandidate(candidate string) string {
 		return resolved
 	}
 	return ""
-}
-
-func browserExecutableCandidates() []string {
-	candidates := []string{
-		os.Getenv("CHROME_BIN"),
-		os.Getenv("CHROMIUM_BIN"),
-		"chromium",
-		"chromium-browser",
-		"google-chrome",
-		"google-chrome-stable",
-		"msedge",
-		"microsoft-edge",
-	}
-	if runtime.GOOS == "windows" {
-		candidates = append(candidates,
-			"chrome.exe",
-			"msedge.exe",
-			filepath.Join(os.Getenv("ProgramFiles"), "Google", "Chrome", "Application", "chrome.exe"),
-			filepath.Join(os.Getenv("ProgramFiles(x86)"), "Google", "Chrome", "Application", "chrome.exe"),
-			filepath.Join(os.Getenv("ProgramFiles"), "Microsoft", "Edge", "Application", "msedge.exe"),
-			filepath.Join(os.Getenv("ProgramFiles(x86)"), "Microsoft", "Edge", "Application", "msedge.exe"),
-		)
-	}
-	return candidates
 }

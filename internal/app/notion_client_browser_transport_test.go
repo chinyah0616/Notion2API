@@ -1,13 +1,15 @@
 package app
 
 import (
+	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
 	"time"
 )
 
-func TestResolveBrowserExecutablePathPrefersCHROMEBIN(t *testing.T) {
+func TestResolvePlaywrightBrowserExecutablePathPrefersCHROMEBIN(t *testing.T) {
 	tmpDir := t.TempDir()
 	chromeBin := filepath.Join(tmpDir, "chrome-bin")
 	chromiumBin := filepath.Join(tmpDir, "chromium-bin")
@@ -21,12 +23,12 @@ func TestResolveBrowserExecutablePathPrefersCHROMEBIN(t *testing.T) {
 	t.Setenv("CHROME_BIN", chromeBin)
 	t.Setenv("CHROMIUM_BIN", chromiumBin)
 
-	if got := resolveBrowserExecutablePath(); got != chromeBin {
-		t.Fatalf("resolveBrowserExecutablePath() = %q, want %q", got, chromeBin)
+	if got := resolvePlaywrightBrowserExecutablePath(); got != chromeBin {
+		t.Fatalf("resolvePlaywrightBrowserExecutablePath() = %q, want %q", got, chromeBin)
 	}
 }
 
-func TestResolveBrowserExecutablePathSkipsMissingCHROMEBIN(t *testing.T) {
+func TestResolvePlaywrightBrowserExecutablePathSkipsMissingCHROMEBIN(t *testing.T) {
 	tmpDir := t.TempDir()
 	chromiumBin := filepath.Join(tmpDir, "chromium-bin")
 	if err := os.WriteFile(chromiumBin, []byte(""), 0o644); err != nil {
@@ -36,8 +38,8 @@ func TestResolveBrowserExecutablePathSkipsMissingCHROMEBIN(t *testing.T) {
 	t.Setenv("CHROME_BIN", filepath.Join(tmpDir, "missing-chrome"))
 	t.Setenv("CHROMIUM_BIN", chromiumBin)
 
-	if got := resolveBrowserExecutablePath(); got != chromiumBin {
-		t.Fatalf("resolveBrowserExecutablePath() = %q, want %q", got, chromiumBin)
+	if got := resolvePlaywrightBrowserExecutablePath(); got != chromiumBin {
+		t.Fatalf("resolvePlaywrightBrowserExecutablePath() = %q, want %q", got, chromiumBin)
 	}
 }
 
@@ -90,5 +92,47 @@ func TestBuildBrowserTransportRequestUsesCookieLocale(t *testing.T) {
 	}
 	if got, want := request.Locale, "zh-CN"; got != want {
 		t.Fatalf("request locale = %q, want %q", got, want)
+	}
+}
+
+func TestRunInferenceTranscriptInBrowserUsesPlaywrightOnly(t *testing.T) {
+	client := newBestEffortTestClient("https://www.notion.so")
+
+	origPlaywright := runPlaywrightBrowserFallback
+	defer func() {
+		runPlaywrightBrowserFallback = origPlaywright
+	}()
+
+	playwrightCalls := 0
+	runPlaywrightBrowserFallback = func(ctx context.Context, _ *NotionAIClient, _ map[string]any) (string, error) {
+		playwrightCalls++
+		if err := ctx.Err(); err != nil {
+			return "", err
+		}
+		return "{\"type\":\"agent-inference\"}\n", nil
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Millisecond)
+	defer cancel()
+
+	body, err := runInferenceTranscriptInBrowser(ctx, client, map[string]any{"threadId": "thread-test"})
+	if err != nil {
+		t.Fatalf("runInferenceTranscriptInBrowser returned error: %v", err)
+	}
+	if body == "" {
+		t.Fatalf("expected fallback body")
+	}
+	if playwrightCalls != 1 {
+		t.Fatalf("expected playwright fallback once, got %d", playwrightCalls)
+	}
+}
+
+func TestClassifyBrowserHelperExecErrorPrefersContextDeadline(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	err := classifyBrowserHelperExecError(ctx, "node", errors.New("signal: killed"), "")
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("expected context cancellation, got %v", err)
 	}
 }

@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 )
 
 func newBrowserFallbackTestClient(baseURL string) *NotionAIClient {
@@ -231,5 +232,91 @@ func TestRunPromptReturnsBrowserChallengeErrorWithoutPolling(t *testing.T) {
 	}
 	if fallbackCalls != 1 {
 		t.Fatalf("expected browser fallback to run once, got %d", fallbackCalls)
+	}
+}
+
+func TestRunPromptBrowserFallbackUsesFullParentBudget(t *testing.T) {
+	const trustMessageID = "msg-trust-budget"
+	const browserMessageID = "msg-browser-budget"
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/v3/runInferenceTranscript" {
+			t.Fatalf("unexpected path: %s", r.URL.Path)
+		}
+		var payload map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			t.Fatalf("decode payload failed: %v", err)
+		}
+		threadID := strings.TrimSpace(stringValue(payload["threadId"]))
+		if threadID == "" {
+			t.Fatalf("runInference payload missing threadId")
+		}
+		w.Header().Set("Content-Type", "application/x-ndjson")
+		_, _ = w.Write([]byte(buildTrustRuleDeniedResponse(t, threadID, trustMessageID, "trust-rule-denied")))
+	}))
+	defer server.Close()
+
+	client := newBrowserFallbackTestClient(server.URL)
+	client.browserRunInferenceFallback = func(ctx context.Context, payload map[string]any) (string, error) {
+		select {
+		case <-time.After(60 * time.Millisecond):
+		case <-ctx.Done():
+			return "", ctx.Err()
+		}
+		return buildSuccessfulAgentInferenceNDJSON(t, browserMessageID, "budget-ok"), nil
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Millisecond)
+	defer cancel()
+
+	result, err := client.RunPrompt(ctx, PromptRunRequest{
+		Prompt:       "hello",
+		PublicModel:  "opus-4.7",
+		NotionModel:  "apricot-sorbet-medium",
+		UseWebSearch: false,
+	})
+	if err != nil {
+		t.Fatalf("RunPrompt returned error: %v", err)
+	}
+	if result.Text != "budget-ok" {
+		t.Fatalf("result text mismatch: got %q want %q", result.Text, "budget-ok")
+	}
+	if result.MessageID != browserMessageID {
+		t.Fatalf("message id mismatch: got %q want %q", result.MessageID, browserMessageID)
+	}
+}
+
+func TestBrowserFallbackTimeoutForPayloadScalesWithPayloadSize(t *testing.T) {
+	small := browserFallbackTimeoutForPayload(context.Background(), map[string]any{
+		"prompt": "short",
+	})
+	large := browserFallbackTimeoutForPayload(context.Background(), map[string]any{
+		"prompt": strings.Repeat("x", 20*1024),
+	})
+
+	if small != browserFallbackTimeout {
+		t.Fatalf("small payload timeout = %s, want %s", small, browserFallbackTimeout)
+	}
+	if large <= small {
+		t.Fatalf("large payload timeout = %s, want > %s", large, small)
+	}
+	if large > browserFallbackTimeoutMax {
+		t.Fatalf("large payload timeout = %s, want <= %s", large, browserFallbackTimeoutMax)
+	}
+}
+
+func TestBrowserFallbackTimeoutForPayloadHonorsParentDeadline(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 40*time.Millisecond)
+	defer cancel()
+
+	got := browserFallbackTimeoutForPayload(ctx, map[string]any{
+		"prompt": strings.Repeat("x", 20*1024),
+	})
+
+	if got <= 0 {
+		t.Fatalf("expected positive timeout, got %s", got)
+	}
+	if got > 40*time.Millisecond {
+		t.Fatalf("timeout = %s, want <= 40ms", got)
 	}
 }
