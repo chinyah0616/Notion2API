@@ -380,7 +380,7 @@ func (b *promptGuardStreamBuffer) Push(delta string) error {
 	return b.emitSanitized(current)
 }
 
-func (b *promptGuardStreamBuffer) FlushFinal(text string, chunkRunes int) error {
+func (b *promptGuardStreamBuffer) FlushFinal(text string) error {
 	sanitized := sanitizePromptGuardDeliveredText(text)
 	if sanitized == "" {
 		sanitized = sanitizePromptGuardDeliveredText(b.rawText.String())
@@ -395,23 +395,16 @@ func (b *promptGuardStreamBuffer) FlushFinal(text string, chunkRunes int) error 
 		b.emittedText.WriteString(sanitized)
 		return nil
 	}
-	for _, part := range splitTextChunks(sanitized, chunkRunes) {
-		if part == "" {
-			continue
-		}
-		if err := b.forward(part); err != nil {
-			return err
-		}
-		b.emittedText.WriteString(part)
+	if err := b.forward(sanitized); err != nil {
+		return err
 	}
+	b.emittedText.WriteString(sanitized)
 	return nil
 }
 
 func runPromptWithPromptGuard(ctx context.Context, cfg AppConfig, request PromptRunRequest, onDelta func(string) error, execute promptGuardExecutor) (InferenceResult, error) {
 	current := promptGuardPrepareRequest(cfg, request)
 	retryBudget := promptGuardRetryBudget(cfg, current)
-	chunkRunes := maxInt(cfg.StreamChunkRunes, 24)
-
 	if onDelta == nil {
 		var lastResult InferenceResult
 		for attempt := 0; ; attempt++ {
@@ -454,14 +447,14 @@ func runPromptWithPromptGuard(ctx context.Context, cfg AppConfig, request Prompt
 			recovered, err := execute(ctx, recoveryRequest, nil)
 			if err == nil && !isPromptGuardRefusal(recovered.Text) {
 				recovered.Text = sanitizePromptGuardDeliveredText(recovered.Text)
-				if flushErr := buffer.FlushFinal(recovered.Text, chunkRunes); flushErr != nil {
+				if flushErr := buffer.FlushFinal(recovered.Text); flushErr != nil {
 					return InferenceResult{}, flushErr
 				}
 				return recovered, nil
 			}
 		}
 		lastResult.Text = sanitizePromptGuardDeliveredText(lastResult.Text)
-		if err := buffer.FlushFinal(lastResult.Text, chunkRunes); err != nil {
+		if err := buffer.FlushFinal(lastResult.Text); err != nil {
 			return InferenceResult{}, err
 		}
 		return lastResult, nil
