@@ -1,6 +1,8 @@
 package main
 
-import "notion2api/internal/app"
+import (
+	"notion2api/internal/app"
+)
 
 func main() {
 	app.Main()

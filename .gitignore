@@ -41,3 +41,4 @@ frontend/out/
 *.spec.tsx
 __tests__/
 WEBUI_DEVELOPMENT_GUIDE.md
+.serena/

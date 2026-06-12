@@ -156,8 +156,10 @@ func sortDispatchCandidates(cfg AppConfig, accounts []NotionAccount, now time.Ti
 	sort.Slice(accounts, func(i, j int) bool {
 		left := accounts[i]
 		right := accounts[j]
-		leftActive := canonicalEmailKey(left.Email) == activeKey
-		rightActive := canonicalEmailKey(right.Email) == activeKey
+		leftKey := getAccountEmailKey(left)
+		rightKey := getAccountEmailKey(right)
+		leftActive := leftKey == activeKey
+		rightActive := rightKey == activeKey
 		if leftActive != rightActive {
 			return leftActive
 		}
@@ -183,11 +185,11 @@ func sortDispatchCandidates(cfg AppConfig, accounts []NotionAccount, now time.Ti
 		if !leftUsed.Equal(rightUsed) {
 			return leftUsed.Before(rightUsed)
 		}
-		return canonicalEmailKey(left.Email) < canonicalEmailKey(right.Email)
+		return leftKey < rightKey
 	})
 }
 
-func pickDispatchCandidates(cfg AppConfig, now time.Time) []NotionAccount {
+func buildDispatchCandidateOrder(cfg AppConfig, now time.Time) []NotionAccount {
 	candidates := make([]NotionAccount, 0, len(cfg.Accounts))
 	for _, account := range cfg.Accounts {
 		account = ensureAccountPaths(cfg, account)
@@ -197,6 +199,16 @@ func pickDispatchCandidates(cfg AppConfig, now time.Time) []NotionAccount {
 	}
 	sortDispatchCandidates(cfg, candidates, now)
 	return candidates
+}
+
+func pickDispatchCandidatesFromSnapshot(bundle *snapshotBundle, now time.Time) []NotionAccount {
+	if bundle == nil {
+		return nil
+	}
+	if len(bundle.DispatchOrder) > 0 {
+		return bundle.DispatchOrder
+	}
+	return buildDispatchCandidateOrder(bundle.Config, now)
 }
 
 func applyAccountUpdate(cfg AppConfig, account NotionAccount, makeActive bool) AppConfig {
@@ -223,6 +235,7 @@ func (s *ServerState) startAutoRelogin(ctx context.Context, cfg AppConfig, accou
 		ProfileDir:       account.ProfileDir,
 		PendingPath:      account.PendingStatePath,
 		StorageStatePath: account.StorageStatePath,
+		AccountEmail:     account.Email,
 	})
 	account = mergeAccountWithStatus(cfg, account, status)
 	account = markAccountReloginPending(account, now)
@@ -236,13 +249,15 @@ func (s *ServerState) startAutoRelogin(ctx context.Context, cfg AppConfig, accou
 	return cfg, fmt.Errorf("verification code required for %s; auto relogin started (%s)", account.Email, reason)
 }
 
-func (a *App) runPromptWithSession(ctx context.Context, cfg AppConfig, session SessionInfo, request PromptRunRequest, onDelta func(string) error) (InferenceResult, error) {
+func (a *App) runPromptWithSession(ctx context.Context, cfg AppConfig, session SessionInfo, accountEmail string, request PromptRunRequest, onDelta func(string) error) (InferenceResult, error) {
 	if a.runPromptWithSessionOverride != nil {
 		return a.runPromptWithSessionOverride(ctx, cfg, session, request, onDelta)
 	}
-	client := newNotionAIClient(session, cfg)
+	transportClientNewTotalMetric.Add("standard", 1)
+	client := newNotionAIClient(session, cfg, accountEmail)
 	if onDelta != nil {
-		client = newNotionAIStreamingClient(session, cfg)
+		transportClientNewTotalMetric.Add("streaming", 1)
+		client = newNotionAIStreamingClient(session, cfg, accountEmail)
 	}
 	execute := func(ctx context.Context, current PromptRunRequest, forward func(string) error) (InferenceResult, error) {
 		if forward == nil {
@@ -253,16 +268,18 @@ func (a *App) runPromptWithSession(ctx context.Context, cfg AppConfig, session S
 	return execute(ctx, request, onDelta)
 }
 
-func (a *App) runPromptWithSessionWithSink(ctx context.Context, cfg AppConfig, session SessionInfo, request PromptRunRequest, sink InferenceStreamSink) (InferenceResult, error) {
+func (a *App) runPromptWithSessionWithSink(ctx context.Context, cfg AppConfig, session SessionInfo, accountEmail string, request PromptRunRequest, sink InferenceStreamSink) (InferenceResult, error) {
 	if a.runPromptWithSessionSinkOverride != nil {
 		return a.runPromptWithSessionSinkOverride(ctx, cfg, session, request, sink)
 	}
 	if a.runPromptWithSessionOverride != nil {
 		return a.runPromptWithSessionOverride(ctx, cfg, session, request, sink.Text)
 	}
-	client := newNotionAIStreamingClient(session, cfg)
+	transportClientNewTotalMetric.Add("streaming", 1)
+	client := newNotionAIStreamingClient(session, cfg, accountEmail)
 	if sink.Text == nil && sink.Reasoning == nil && sink.ReasoningWarmup == nil && sink.KeepAlive == nil {
-		client = newNotionAIClient(session, cfg)
+		transportClientNewTotalMetric.Add("standard", 1)
+		client = newNotionAIClient(session, cfg, accountEmail)
 	}
 	if sink.Reasoning != nil || sink.ReasoningWarmup != nil || sink.KeepAlive != nil {
 		return client.RunPromptStreamWithSink(ctx, request, sink)
